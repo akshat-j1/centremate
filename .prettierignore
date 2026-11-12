@@ -1,0 +1,4 @@
+node_modules
+.next
+scratch
+package-lock.json
