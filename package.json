@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test tests/*.test.ts"
+    "test": "node --import tsx --test tests/*.test.ts tests/*.test.tsx",
+    "test:db": "node scripts/test-database.mjs"
   },
   "dependencies": {
     "@radix-ui/react-slot": "^1.2.3",
@@ -26,12 +27,16 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.0",
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/react": "^16.3.3",
+    "@types/jsdom": "^30.0.0",
     "@types/node": "^22.0.0",
     "@types/papaparse": "^5.3.16",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "eslint": "^9.0.0",
     "eslint-config-next": "^16.0.0",
+    "jsdom": "^29.1.1",
     "prettier": "^3.10.1",
     "tailwindcss": "^4.1.0",
     "tsx": "^4.20.0",

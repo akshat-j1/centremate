@@ -3,18 +3,31 @@ import { spawnSync } from "node:child_process";
 import {
   readFileSync,
   writeFileSync,
-  unlinkSync,
   existsSync,
   mkdirSync,
+  chmodSync,
 } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline/promises";
+import { checkProductionHttp, assertHttpChecks } from "./production-health.mjs";
+import { sourceSnapshot } from "./source-snapshot.mjs";
 import { randomBytes } from "node:crypto";
+import {
+  requireProject,
+  existingEnvironment,
+  mergeEnvironment,
+  productionSql,
+  SCHEMA_CHECKS,
+  READINESS_CHECKS,
+  readOnlyQueryArgs,
+  assertChecks,
+  parseProjectKeys,
+  parseCliJson,
+} from "./infrastructure-safety.mjs";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 process.chdir(root);
 const ORG = "wlvfxeuxgdybfxthizwy",
-  FORBIDDEN = "zmaemtkhklnbtgpyepqn",
   PROJECT = "prj_FQICpl1AG2W5p3GTwZKt9eF8GjiV",
   TEAM = "akshat-9076",
   REPO = "akshat-j1/centremate",
@@ -46,7 +59,7 @@ function run(bin, args, { capture = false, input, extraEnv = {} } = {}) {
   return result.stdout?.trim() ?? "";
 }
 function json(bin, args) {
-  return JSON.parse(run(bin, args, { capture: true }));
+  return parseCliJson(run(bin, args, { capture: true }));
 }
 function projects() {
   const result = json("supabase", ["projects", "list", "-o", "json"]);
@@ -60,29 +73,18 @@ function projects() {
   return list;
 }
 function project() {
-  const matches = projects().filter(
-    (p) =>
-      p.name === "centremate" &&
-      (p.organization_id === ORG || p.organization_slug === ORG),
-  );
-  if (matches.length > 1)
-    throw new Error(
-      "Multiple CentreMate projects found. Resolve the duplicate before continuing.",
-    );
-  const p = matches[0];
-  if (p && (p.id === FORBIDDEN || !/^[a-z]{20}$/.test(p.id)))
-    throw new Error("Unsafe project ref; refusing all operations.");
-  return p;
+  return requireProject(projects());
 }
 function verifiedRef() {
-  const p = project();
-  if (!p)
-    throw new Error(
-      "Create CentreMate first by running this script without flags.",
-    );
-  return p.id;
+  return project().id;
 }
 async function ask(prompt) {
+  if (!process.stdin.isTTY)
+    throw new Error(
+      "Interactive input is required for " +
+        prompt +
+        " Use an authenticated Terminal for this step.",
+    );
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
     return (await rl.question(prompt)).trim();
@@ -91,6 +93,10 @@ async function ask(prompt) {
   }
 }
 function secret(prompt) {
+  if (!process.stdin.isTTY)
+    throw new Error(
+      "Google OAuth secret entry requires an interactive Terminal.",
+    );
   process.stderr.write(prompt);
   const result = spawnSync(
     "/bin/zsh",
@@ -108,7 +114,10 @@ function config(google = false) {
   );
 }
 function gitPublish() {
-  if (!existsSync(".git")) run("git", ["init", "-b", "main"]);
+  if (!existsSync(".git"))
+    throw new Error(
+      "Existing CentreMate Git checkout not found; refusing to initialize a replacement.",
+    );
   const branch = run("git", ["branch", "--show-current"], { capture: true });
   if (branch !== "main")
     throw new Error(
@@ -126,15 +135,16 @@ function gitPublish() {
     throw new Error(
       "Origin points to an unrelated repository; refusing to modify it.",
     );
-  const user = json("gh", ["api", "user"]);
-  if (user.login !== "akshat-j1")
-    throw new Error("GitHub CLI must be authenticated as akshat-j1.");
+  // The configured Git credential helper is sufficient; do not require a second gh login.
+  run("git", ["ls-remote", "--exit-code", "origin", "refs/heads/main"], {
+    capture: true,
+  });
   for (const [key, value] of [
-    ["user.name", user.name || user.login],
-    ["user.email", `${user.id}+${user.login}@users.noreply.github.com`],
+    ["user.name", "akshat-j1"],
+    ["user.email", "akshat-j1@users.noreply.github.com"],
   ]) {
     const current = spawnSync("git", ["config", key], { encoding: "utf8" });
-    if (!current.stdout.trim()) run("git", ["config", key, value]);
+    if (!current.stdout?.trim()) run("git", ["config", key, value]);
   }
   run("git", ["add", "."]);
   const staged = run("git", ["diff", "--cached", "--name-only"], {
@@ -155,49 +165,15 @@ function gitPublish() {
       "-m",
       "Configure CentreMate infrastructure and verified deployment",
     ]);
-  // Distinguish absence from authentication or network failure.
-  const lookup = spawnSync("gh", ["api", `repos/${REPO}`], {
-    env,
-    encoding: "utf8",
-  });
-  let repository;
-  try {
-    repository = JSON.parse(lookup.stdout);
-  } catch {
-    throw new Error(
-      "GitHub repository lookup failed. Check CLI authentication/network.",
-    );
-  }
-  if (lookup.status !== 0) {
-    if (
-      repository.message !== "Not Found" ||
-      !lookup.stderr.includes("HTTP 404")
-    )
-      throw new Error(
-        "GitHub lookup failed; refusing to interpret it as a missing repository.",
-      );
-    if (origin.status !== 0)
-      run("gh", [
-        "repo",
-        "create",
-        REPO,
-        "--private",
-        "--source=.",
-        "--remote=origin",
-      ]);
-    else run("gh", ["repo", "create", REPO, "--private"]);
-  } else {
-    if (repository.full_name !== REPO)
-      throw new Error("Unexpected GitHub repository returned.");
-    if (origin.status !== 0)
-      run("git", ["remote", "add", "origin", `https://github.com/${REPO}.git`]);
-  }
   run("git", ["push", "--set-upstream", "origin", "main"]);
 }
 function linkVercel() {
   run("vercel", ["link", "--yes", "--scope", TEAM, "--project", PROJECT]);
   const linked = JSON.parse(readFileSync(".vercel/project.json", "utf8"));
-  if (linked.projectId !== PROJECT)
+  if (
+    linked.projectId !== PROJECT ||
+    linked.orgId !== "team_I14OK6NK4x7TA6VN1qJ39Gjl"
+  )
     throw new Error("Vercel linked the wrong project. Refusing deployment.");
 }
 function envVercel(name, value) {
@@ -229,82 +205,48 @@ function keys(ref) {
     "-o",
     "json",
   ]);
-  const list = Array.isArray(result)
-    ? result
-    : (result.keys ?? result.data?.keys);
-  if (!Array.isArray(list))
-    throw new Error("Unrecognized API key output. No keys were printed.");
-  const anon =
-    list.find((k) => k.name === "anon") ??
-    list.find((k) => k.type === "publishable");
-  const service =
-    list.find((k) => k.name === "service_role") ??
-    list.find((k) => k.type === "secret");
-  if (!anon?.api_key || anon.api_key.includes("..."))
-    throw new Error("A complete public API key is required.");
-  return { anon: anon.api_key, service: service?.api_key };
+  return parseProjectKeys(result);
 }
 function smoke(ref) {
-  // Reuse the actual RLS assertions, replacing only the isolated test database bootstrap.
-  const local = readFileSync("tests/database.sql", "utf8");
-  const body = local.slice(local.indexOf("create function public.assert"));
-  if (body.includes("\\i") || !body.trim().endsWith("rollback;"))
-    throw new Error("Unsafe smoke test source.");
-  writeFileSync(
-    "scratch/live-database-test.sql",
-    "begin;\n-- Broader temporary grants ensure RLS withstands direct table privileges. Rolled back.\ngrant all on all tables in schema public to anon,authenticated;\n" +
-      body,
+  if (ref !== "clnwwhadsalezsdmamsf")
+    throw new Error(
+      "Refusing verification against a different Supabase project.",
+    );
+  productionSql(readFileSync("tests/production-verification.sql", "utf8"));
+  const output = run(
+    "supabase",
+    readOnlyQueryArgs(ref, "tests/production-verification.sql"),
+    { capture: true },
   );
-  run("supabase", [
-    "db",
-    "query",
-    `--remote=${ref}`,
-    "--file",
-    "scratch/live-database-test.sql",
-    "--yes",
-  ]);
+  assertChecks(output, SCHEMA_CHECKS);
   console.log(
-    "Live PostgreSQL transaction completed: 27 authorization/privacy/deduplication assertions; all fixtures rolled back.",
+    "Production schema and privilege checks passed. No transaction statements or production fixtures were sent.",
   );
+}
+function isolatedTests() {
+  run("node", ["scripts/test-database.mjs"]);
 }
 async function verify(ref) {
   smoke(ref);
   const { anon } = keys(ref);
-  const headers = { apikey: anon };
-  const settings = await fetch(`https://${ref}.supabase.co/auth/v1/settings`, {
-    headers,
-  });
-  if (!settings.ok) throw new Error("Supabase Auth settings request failed.");
-  const auth = await settings.json();
-  if (auth.external?.google !== true)
-    throw new Error(
-      "Google provider is not enabled. Run this script with --auth.",
-    );
-  console.log("Google provider enabled: true");
-  const response = await fetch(
-    `https://${ref}.supabase.co/rest/v1/registrations?select=email,whatsapp`,
-    { headers },
-  );
-  if (response.ok) {
-    const rows = await response.json();
-    if (!Array.isArray(rows) || rows.length)
-      throw new Error("Anonymous privacy check failed.");
-  } else if (![401, 403].includes(response.status))
-    throw new Error("Unexpected anonymous API response: " + response.status);
-  console.log("Live anonymous API: student emails and contacts inaccessible.");
-  run("supabase", [
-    "db",
-    "query",
-    `--remote=${ref}`,
-    "--read-only",
-    "do $$ begin if not exists(select 1 from auth.users u where u.last_sign_in_at is not null and u.email_confirmed_at is not null and exists(select 1 from auth.identities i where i.user_id=u.id and i.provider='google')) then raise exception 'No real Google sign-in recorded. Complete Google login on production first.'; end if; end $$;",
-  ]);
-  const head = run("git", ["rev-parse", "HEAD"], { capture: true });
-  const remote = run(
-    "gh",
-    ["api", `repos/${REPO}/git/ref/heads/main`, "--jq", ".object.sha"],
+  const { sourceHash } = sourceSnapshot(root);
+  const http = await checkProductionHttp({ anon, site: SITE, sourceHash });
+  for (const [name, passed] of Object.entries(http))
+    console.log(`${passed ? "PASS" : "BLOCKED"}: ${name}`);
+  assertHttpChecks(http);
+  productionSql(readFileSync("tests/production-readiness.sql", "utf8"));
+  const readiness = run(
+    "supabase",
+    readOnlyQueryArgs(ref, "tests/production-readiness.sql"),
     { capture: true },
   );
+  assertChecks(readiness, READINESS_CHECKS);
+  const head = run("git", ["rev-parse", "HEAD"], { capture: true });
+  const remote = run(
+    "git",
+    ["ls-remote", "--exit-code", "origin", "refs/heads/main"],
+    { capture: true },
+  ).split(/\s+/)[0];
   if (head !== remote) throw new Error("Local HEAD differs from GitHub main.");
   const tracked = run(
     "git",
@@ -316,25 +258,31 @@ async function verify(ref) {
       "Tracked local changes remain; commit, push and deploy them before verifying.",
     );
   const local = JSON.parse(readFileSync("public/version.json", "utf8"));
-  const live = await fetch(SITE + "/version.json?verify=" + Date.now(), {
-    cache: "no-store",
-  });
-  if (!live.ok || (await live.json()).sourceHash !== local.sourceHash)
-    throw new Error("Production source hash differs from local/GitHub source.");
+  if (local.sourceHash !== sourceHash)
+    throw new Error(
+      "The local source manifest is stale; source and deployment are not verified.",
+    );
   console.log(
-    "Verified: live RLS tests, anonymous privacy, real Google sign-in record, local HEAD = GitHub main, production source hash matches.",
+    "Verified: live database API and privacy checks, production client configuration, real Google sign-in and website registration records, local HEAD = GitHub main, deployed source matches current code.",
   );
   console.log(
     "Also confirm that Google login returns to the production page with your signed-in account before inviting students.",
   );
 }
 try {
-  if (!process.stdin.isTTY)
-    throw new Error(
-      "Run this in your Mac Terminal so existing keychain credentials and hidden prompts are accessible.",
-    );
   const mode = process.argv[2];
   if (mode === "--auth") {
+    const local = existsSync(".env.local")
+      ? existingEnvironment(readFileSync(".env.local", "utf8"))
+      : {};
+    if (
+      local.NEXT_PUBLIC_SUPABASE_URL !==
+        "https://clnwwhadsalezsdmamsf.supabase.co" ||
+      !local.NEXT_PUBLIC_SUPABASE_ANON_KEY
+    )
+      throw new Error(
+        "Production database environment is not prepared. Complete environment setup before the OAuth/deployment phase.",
+      );
     const ref = verifiedRef();
     console.log(
       `Google Cloud OAuth Web client callback: https://${ref}.supabase.co/auth/v1/callback`,
@@ -356,86 +304,21 @@ try {
     run("node", ["scripts/prepare-deployment.mjs"]);
     gitPublish();
     linkVercel();
-    run("vercel", [
-      "git",
-      "connect",
-      `https://github.com/${REPO}.git`,
-      "--yes",
-      "--scope",
-      TEAM,
-      "--project",
-      PROJECT,
-    ]);
     run("vercel", ["deploy", "--prod", "--yes", "--scope", TEAM]);
     console.log(
       `OAuth configured. Open ${SITE}, complete Google login, then run: node scripts/setup-infrastructure.mjs --verify`,
     );
+    await verify(ref);
   } else if (mode === "--verify") {
     await verify(verifiedRef());
-  } else if (mode) {
+  } else if (mode && mode !== "--resume") {
     throw new Error(
-      "Supported flags: --auth, --verify, or no flag for provisioning.",
+      "Supported flags: --resume, --auth, or --verify. No replacement resources are created.",
     );
   } else {
-    if (
-      run("gh", ["api", "user", "--jq", ".login"], { capture: true }) !==
-      "akshat-j1"
-    )
-      throw new Error("Authenticate GitHub CLI as akshat-j1 first.");
-    gitPublish();
+    const ref = verifiedRef();
+    isolatedTests();
     linkVercel();
-    run("vercel", [
-      "git",
-      "connect",
-      `https://github.com/${REPO}.git`,
-      "--yes",
-      "--scope",
-      TEAM,
-      "--project",
-      PROJECT,
-    ]);
-    let p = project();
-    if (!p) {
-      if (existsSync("scratch/centremate-create-pending"))
-        throw new Error(
-          "A prior creation attempt has an uncertain outcome. Check the Supabase organization dashboard before deleting scratch/centremate-create-pending and retrying. No duplicate creation attempted.",
-        );
-      console.log(
-        "Confirm the requested organization is on Free in its Supabase Billing dashboard. The API inherits the organization plan.",
-      );
-      if (
-        (await ask(
-          "Type FREE only after verifying the organization plan: ",
-        )) !== "FREE"
-      )
-        throw new Error(
-          "Free plan is not confirmed; no Supabase project was created.",
-        );
-      console.log(
-        "Creating only centremate in the specified organization, default compute, no upgrades or paid options. If Free quota is exhausted, stop; do not upgrade or pause other projects.",
-      );
-      writeFileSync(
-        "scratch/centremate-create-pending",
-        new Date().toISOString(),
-      );
-      run("supabase", [
-        "projects",
-        "create",
-        "centremate",
-        "--org-id",
-        ORG,
-        "--region",
-        "ap-south-1",
-      ]);
-      p = project();
-      if (!p)
-        throw new Error(
-          "Project creation has not appeared in the organization. Check Supabase before retrying; do not create duplicates.",
-        );
-    }
-    const ref = p.id;
-    if (existsSync("scratch/centremate-create-pending"))
-      unlinkSync("scratch/centremate-create-pending");
     writeFileSync(
       "scratch/infrastructure.json",
       JSON.stringify(
@@ -461,39 +344,67 @@ try {
       )
     )
       run("supabase", ["config", "push", `--remote=${ref}`, "--yes"]);
-    const admin = (
-      await ask("Initial admin Google email (lowercase): ")
-    ).toLowerCase();
-    const domains = (
-      await ask(
-        "Approved exact Scaler domains, comma-separated (blank keeps directory closed to students): ",
-      )
-    )
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean);
-    if (
-      !/^[^\s@']+@[^\s@']+\.[^\s@']+$/.test(admin) ||
-      domains.some((d) => !/^[a-z0-9]+([.-][a-z0-9]+)*\.[a-z]{2,}$/.test(d))
-    )
-      throw new Error("Invalid email or domain.");
-    const sql =
-      `insert into public.admins(email) values ('${admin}') on conflict do nothing;\n` +
-      domains
-        .map(
-          (d) =>
-            `insert into public.allowed_domains(domain) values ('${d}') on conflict do nothing;`,
+    const bootstrap = "scratch/bootstrap-admin.sql";
+    const bootstrapIsSafe =
+      existsSync(bootstrap) &&
+      /insert into public\.admins\(email\)/.test(
+        readFileSync(bootstrap, "utf8"),
+      ) &&
+      readFileSync(bootstrap, "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .every((line) =>
+          /^insert into public\.(admins\(email\)|allowed_domains\(domain\)) values \('[a-z0-9@._+\-]+'\) on conflict do nothing;$/.test(
+            line,
+          ),
+        );
+    if (bootstrapIsSafe) {
+      console.log(
+        "Reusing the existing idempotent admin/domain bootstrap; no users or permissions are removed.",
+      );
+      run("supabase", [
+        "db",
+        "query",
+        `--remote=${ref}`,
+        "--file",
+        bootstrap,
+        "--yes",
+      ]);
+    } else {
+      const admin = (
+        await ask("Initial admin Google email (lowercase): ")
+      ).toLowerCase();
+      const domains = (
+        await ask(
+          "Approved exact Scaler domains, comma-separated (blank keeps directory closed to students): ",
         )
-        .join("\n");
-    writeFileSync("scratch/bootstrap-admin.sql", sql, { mode: 0o600 });
-    run("supabase", [
-      "db",
-      "query",
-      `--remote=${ref}`,
-      "--file",
-      "scratch/bootstrap-admin.sql",
-      "--yes",
-    ]);
+      )
+        .split(",")
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean);
+      if (
+        !/^[^\s@']+@[^\s@']+\.[^\s@']+$/.test(admin) ||
+        domains.some((d) => !/^[a-z0-9]+([.-][a-z0-9]+)*\.[a-z]{2,}$/.test(d))
+      )
+        throw new Error("Invalid email or domain.");
+      const sql =
+        `insert into public.admins(email) values ('${admin}') on conflict do nothing;\n` +
+        domains
+          .map(
+            (d) =>
+              `insert into public.allowed_domains(domain) values ('${d}') on conflict do nothing;`,
+          )
+          .join("\n");
+      writeFileSync("scratch/bootstrap-admin.sql", sql, { mode: 0o600 });
+      run("supabase", [
+        "db",
+        "query",
+        `--remote=${ref}`,
+        "--file",
+        "scratch/bootstrap-admin.sql",
+        "--yes",
+      ]);
+    }
     smoke(ref);
     const k = keys(ref);
     const values = {
@@ -501,21 +412,12 @@ try {
       NEXT_PUBLIC_SUPABASE_ANON_KEY: k.anon,
       NEXT_PUBLIC_SITE_URL: SITE,
     };
-    if (existsSync(".env.local")) {
-      const previous = Object.fromEntries(
-        readFileSync(".env.local", "utf8")
-          .split("\n")
-          .map((line) => line.match(/^([A-Z_]+)=(.*)$/))
-          .filter(Boolean)
-          .map((match) => [match[1], match[2]]),
-      );
-      if (previous.NEXT_PUBLIC_SUPABASE_URL !== values.NEXT_PUBLIC_SUPABASE_URL)
-        throw new Error(
-          ".env.local points to another project; refusing to overwrite it.",
-        );
-      for (const key of ["SUPABASE_SERVICE_ROLE_KEY", "FORM_SYNC_SECRET"])
-        if (previous[key]) values[key] = previous[key];
-    }
+    const previousText = existsSync(".env.local")
+      ? readFileSync(".env.local", "utf8")
+      : "";
+    const previous = existingEnvironment(previousText);
+    if (previous.FORM_SYNC_SECRET)
+      values.FORM_SYNC_SECRET = previous.FORM_SYNC_SECRET;
     if (
       k.service &&
       !k.service.includes("...") &&
@@ -524,36 +426,22 @@ try {
       values.SUPABASE_SERVICE_ROLE_KEY = k.service;
     if (values.SUPABASE_SERVICE_ROLE_KEY && !values.FORM_SYNC_SECRET)
       values.FORM_SYNC_SECRET = randomBytes(32).toString("hex");
-    if (!existsSync(".env.local"))
-      writeFileSync(
-        ".env.local",
-        Object.entries(values)
-          .map(([n, v]) => `${n}=${v}`)
-          .join("\n") + "\n",
-        { mode: 0o600 },
-      );
+    const merged = mergeEnvironment(previousText, values);
+    writeFileSync(".env.local", merged, { mode: 0o600 });
+    chmodSync(".env.local", 0o600);
     linkVercel();
     for (const [name, value] of Object.entries(values)) envVercel(name, value);
     run("npm", ["test"]);
     run("npm", ["run", "typecheck"]);
     run("npm", ["run", "lint"]);
-    run("npm", ["run", "build"]);
+    run("npm", ["run", "build", "--", "--webpack"]);
     run("node", ["scripts/prepare-deployment.mjs"]);
     gitPublish();
-    run("vercel", [
-      "git",
-      "connect",
-      `https://github.com/${REPO}.git`,
-      "--yes",
-      "--scope",
-      TEAM,
-      "--project",
-      PROJECT,
-    ]);
     run("vercel", ["deploy", "--prod", "--yes", "--scope", TEAM]);
     console.log(
-      `Database, environment and repository configured. Google login remains incomplete until --auth is run.\nNext: node scripts/setup-infrastructure.mjs --auth\nGoogle callback: https://${ref}.supabase.co/auth/v1/callback\nRepository: https://github.com/${REPO}`,
+      `Environment and code deployed to the existing project. Functional production readiness is checked next; deployment alone does not pass. Google callback: https://${ref}.supabase.co/auth/v1/callback`,
     );
+    await verify(ref);
   }
 } catch (error) {
   console.error("\nBLOCKED:", error.message);

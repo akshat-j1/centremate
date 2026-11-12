@@ -1,0 +1,6 @@
+project_id = "centremate"
+
+[auth]
+enabled = true
+site_url = "https://centremate-akshat-9076.vercel.app"
+additional_redirect_urls = ["https://centremate-akshat-9076.vercel.app/auth/callback", "http://localhost:3000/auth/callback"]

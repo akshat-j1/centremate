@@ -57,16 +57,26 @@ export async function POST(request: NextRequest) {
       process.env.SUPABASE_SERVICE_ROLE_KEY,
       { auth: { persistSession: false, autoRefreshToken: false } },
     );
-    const { error } = await db
+    const { data, error } = await db
       .from("registrations")
-      .upsert(rows, { onConflict: "exam_id,email", ignoreDuplicates: true });
+      .upsert(rows, { onConflict: "exam_id,email", ignoreDuplicates: true })
+      .select("id");
     if (error)
       return NextResponse.json(
-        { error: "Import failed. Verify exam and centre IDs." },
-        { status: 400 },
+        {
+          error:
+            error.code === "23503" || error.code === "23514"
+              ? "Import failed. Verify the exam, centre and row values."
+              : "Import service is temporarily unavailable. Retry safely; duplicates will be skipped.",
+        },
+        {
+          status: error.code === "23503" || error.code === "23514" ? 400 : 503,
+        },
       );
     return NextResponse.json({
       accepted: rows.length,
+      inserted: data?.length ?? 0,
+      skipped: rows.length - (data?.length ?? 0),
       duplicates: "skipped",
       visibility: "private",
     });

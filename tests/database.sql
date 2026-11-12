@@ -1,18 +1,18 @@
 \set ON_ERROR_STOP on
+-- Isolated PostgreSQL fixture suite: never send this file to a hosted project.
+select current_database() = 'centremate_isolated_tests' as isolated_database \gset
+\if :isolated_database
+\else
+do $$ begin raise exception 'Refusing fixtures outside the dedicated isolated test database'; end $$;
+\endif
 begin;
-create role anon nologin; create role authenticated nologin;
-create schema auth;
-create table auth.users(id uuid primary key,email_confirmed_at timestamptz);
-create function auth.jwt() returns jsonb language sql stable as $$ select coalesce(current_setting('request.jwt.claims',true),'{}')::jsonb $$;
-create function auth.uid() returns uuid language sql stable as $$ select (auth.jwt()->>'sub')::uuid $$;
-grant usage on schema auth,public to anon,authenticated;
-grant execute on all functions in schema auth to anon,authenticated;
+\i /tmp/isolated-bootstrap.sql
 \i /tmp/migration.sql
 -- Mirror Supabase's default API privileges, with RLS providing authorization.
 grant all on all tables in schema public to anon,authenticated;
 create function public.assert(ok boolean,label text) returns void language plpgsql as $$begin if ok is distinct from true then raise exception 'FAIL: %',label;end if;raise notice 'PASS: %',label;end$$;
 create function public.expect_denied(query text,label text) returns void language plpgsql as $$ begin begin execute query;exception when insufficient_privilege then raise notice 'PASS: %',label;return;end;raise exception 'FAIL: %',label;end $$;
-insert into auth.users values('11111111-1111-4111-8111-111111111111',now()),('22222222-2222-4222-8222-222222222222',now()),('33333333-3333-4333-8333-333333333333',now()),('44444444-4444-4444-8444-444444444444',null);
+insert into auth.users(id,email_confirmed_at) values('11111111-1111-4111-8111-111111111111',now()),('22222222-2222-4222-8222-222222222222',now()),('33333333-3333-4333-8333-333333333333',now()),('44444444-4444-4444-8444-444444444444',null),('55555555-5555-4555-8555-555555555555',now());
 insert into public.allowed_domains values('scaler.example');
 insert into public.admins values('admin@scaler.example');
 insert into public.exams values('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','TEST EXAM','2099-01-01',true);
@@ -26,6 +26,7 @@ select public.assert((select count(*)=0 from public.registrations),'Anonymous ca
 select public.assert((select count(*)=0 from public.directory('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')),'Anonymous cannot read directory');
 select public.assert((select public.contact('11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa') is null),'Anonymous cannot access contact');
 select public.expect_denied($q$insert into public.exams(name,exam_date) values('ATTACK','2099-01-01')$q$,'Anonymous cannot manage exams');
+select public.expect_denied($q$select public.set_return_status('11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa',true)$q$,'Anonymous cannot set return status');
 set local role authenticated;
 set local request.jwt.claims='{"sub":"11111111-1111-4111-8111-111111111111","email":"one@scaler.example"}';
 select public.assert(public.is_approved(),'Verified allowlisted user approved');
@@ -42,6 +43,15 @@ update public.registrations set name='Forged' where email='two@scaler.example';
 select public.assert((select name='Two' from public.directory('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb') where id='22222222-aaaa-4aaa-8aaa-aaaaaaaaaaaa'),'Cannot edit another student');
 select public.expect_denied($q$select public.import_form('[]'::jsonb)$q$,'Student cannot import');
 select public.expect_denied($q$insert into public.admins values('one@scaler.example')$q$,'Student cannot promote self');
+select public.assert(public.set_return_status('11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa',true)=now()+interval '2 hours','Readiness expiry comes from the database clock');
+update public.registrations set name='One' where email='one@scaler.example';
+select public.assert((select ready_until=now()+interval '2 hours' from public.registrations),'Editing a profile at the same centre preserves return status');
+select public.assert(public.set_return_status('11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa',false) is null,'Student can cancel return status');
+select public.expect_denied($q$select public.set_return_status('22222222-aaaa-4aaa-8aaa-aaaaaaaaaaaa',true)$q$,'Student cannot set another student return status');
+update public.registrations set visible=false where email='one@scaler.example';
+select public.assert(public.contact('11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa') is null,'Withdrawing consent hides contact immediately');
+select public.assert((select count(*)=1 from public.directory('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')),'Withdrawing consent removes directory entry');
+update public.registrations set visible=true where email='one@scaler.example';
 set local request.jwt.claims='{"sub":"22222222-2222-4222-8222-222222222222","email":"outsider@elsewhere.example"}';
 select public.assert(not public.is_approved(),'Unknown domain denied');
 select public.assert((select count(*)=0 from public.directory('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')),'Unapproved user cannot read directory');
@@ -55,9 +65,39 @@ select public.assert((select not visible and whatsapp is null from public.regist
 select public.assert((select name='One' and hostel='Uni 1' from public.registrations where email='one@scaler.example'),'Import preserves website choices');
 select public.import_form('[{"exam_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","centre_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","email":"import@scaler.example","name":"Imported","hostel":"Uni 2"}]');
 select public.assert((select count(*)=4 from public.registrations),'Repeated imports are idempotent');
+set local request.jwt.claims='{"sub":"55555555-5555-4555-8555-555555555555","email":"import@scaler.example"}';
+insert into public.registrations(exam_id,centre_id,email,name,hostel,source,visible) values('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb','import@scaler.example','Claimed','Uni 1','website',false) on conflict(exam_id,email) do update set name=excluded.name,hostel=excluded.hostel,source=excluded.source;
+select public.assert((select count(*)=1 from public.registrations),'Student can claim own imported registration without duplication');
+select public.assert((select source='website' and name='Claimed' and not visible from public.registrations),'Claim preserves private default until explicit student consent');
 set local request.jwt.claims='{"sub":"11111111-1111-4111-8111-111111111111","email":"one@scaler.example"}';
+select public.set_return_status('11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa',true);
 update public.registrations set centre_id='cccccccc-cccc-4ccc-8ccc-cccccccccccc' where email='one@scaler.example';
 select public.assert(public.contact('22222222-aaaa-4aaa-8aaa-aaaaaaaaaaaa') is null,'Contact denied across different centres');
+select public.assert((select ready_until is null from public.registrations),'Moving centres clears old return status');
 delete from public.registrations where email='one@scaler.example';
 select public.assert((select count(*)=0 from public.registrations),'Student can delete own registration');
+select public.assert((select count(*)=1 from public.registration_opt_outs),'Deletion stores only a private reimport suppression hash');
+reset role;
+set local request.jwt.claims='{"role":"service_role"}';
+insert into public.registrations(exam_id,centre_id,email,name,hostel,source,visible) values('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb','one@scaler.example','Service sync retry','Uni 1','form',false) on conflict(exam_id,email) do nothing;
+select public.assert(not exists(select 1 from public.registrations where email='one@scaler.example'),'Service sync also honors student deletion');
+set local role authenticated;
+
+set local request.jwt.claims='{"sub":"22222222-2222-4222-8222-222222222222","email":"two@scaler.example"}';
+select public.assert((select count(*)=0 from public.registration_opt_outs),'Another student cannot read deletion suppression');
+select public.expect_denied($q$insert into public.registrations(exam_id,centre_id,email,name,hostel,source) values('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb','one@scaler.example','Probe','Uni 1','form')$q$,'Suppressed imports cannot bypass caller RLS');
+
+set local request.jwt.claims='{"sub":"33333333-3333-4333-8333-333333333333","email":"admin@scaler.example"}';
+select public.assert(public.import_form('[{"exam_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","centre_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","email":"one@scaler.example","name":"Form retry","hostel":"Uni 1"}]')=0,'Repeated Form imports cannot resurrect a deleted registration');
+set local request.jwt.claims='{"sub":"11111111-1111-4111-8111-111111111111","email":"one@scaler.example"}';
+insert into public.registrations(exam_id,centre_id,email,name,hostel,source,visible) values('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb','one@scaler.example','One','Uni 1','website',false);
+select public.assert((select count(*)=1 from public.registrations),'A student can deliberately register again after deletion');
+select public.assert((select count(*)=0 from public.registration_opt_outs),'Deliberate registration clears reimport suppression');
+delete from public.registrations where email='one@scaler.example';
+set local request.jwt.claims='{"sub":"33333333-3333-4333-8333-333333333333","email":"admin@scaler.example"}';
+delete from public.centres where id='bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+select public.assert((select count(*)=0 from public.registrations),'Admin centre deletion cascades safely through registration triggers');
+delete from public.exams where id='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+set local request.jwt.claims='{"sub":"11111111-1111-4111-8111-111111111111","email":"one@scaler.example"}';
+select public.assert((select count(*)=0 from public.registration_opt_outs),'Exam deletion clears its private suppression keys');
 rollback;

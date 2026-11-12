@@ -24,7 +24,14 @@ import {
 import type { User } from "@supabase/supabase-js";
 import { Button } from "./ui/button";
 import { browserClient, configured } from "@/lib/supabase";
-type Exam = { id: string; name: string; exam_date: string };
+import {
+  registrationSchema,
+  centreSchema,
+  safeReturnPath,
+  isReturning,
+  errorMessage,
+} from "@/lib/workflows";
+type Exam = { id: string; name: string; exam_date: string; active: boolean };
 type Centre = { id: string; name: string; address: string; total?: number };
 type Mate = {
   id: string;
@@ -35,8 +42,15 @@ type Mate = {
   ready_until: string | null;
   has_contact: boolean;
 };
-const db = configured ? browserClient() : null;
-export default function CentreMate({ centreId }: { centreId?: string }) {
+const defaultClient = configured ? browserClient() : null;
+export default function CentreMate({
+  centreId,
+  client = defaultClient,
+}: {
+  centreId?: string;
+  client?: ReturnType<typeof browserClient> | null;
+}) {
+  const db = client;
   const [user, setUser] = useState<User | null>(null),
     [approved, setApproved] = useState(false),
     [admin, setAdmin] = useState(false),
@@ -46,11 +60,15 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
     [query, setQuery] = useState(""),
     [loading, setLoading] = useState(true),
     [message, setMessage] = useState(""),
+    [loadFailed, setLoadFailed] = useState(false),
+    [modalError, setModalError] = useState(""),
+    [peopleLoading, setPeopleLoading] = useState(false),
     [modal, setModal] = useState<"register" | "request" | null>(null),
     [mates, setMates] = useState<Mate[]>([]),
     [tab, setTab] = useState("Everyone"),
     [busy, setBusy] = useState(false),
     [own, setOwn] = useState<Record<string, unknown> | null>(null);
+  const refreshSequence = useRef(0);
   const dialogRef = useRef<HTMLDialogElement>(null);
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -63,6 +81,10 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
       document.body.style.overflow = overflow;
     };
   }, [modal]);
+  function openModal(value: "register" | "request") {
+    setModalError("");
+    setModal(value);
+  }
   const centre = centres.find((c) => c.id === centreId);
   const ownAtCentre = own?.centre_id === centreId;
   const load = useCallback(async () => {
@@ -76,18 +98,35 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
       data: { user: u },
     } = await db.auth.getUser();
     setUser(u);
-    const [{ data: e, error: ee }, { data: c, error: ce }] = await Promise.all([
-      db.from("exams").select("*").eq("active", true).order("exam_date"),
+    const [
+      { data: allExams, error: ee },
+      { data: c, error: ce },
+      { data: plans },
+    ] = await Promise.all([
+      db.from("exams").select("*").order("exam_date"),
       db.from("centres").select("*").order("name"),
+      u
+        ? db
+            .from("registrations")
+            .select("exam_id")
+            .eq("email", u.email?.toLowerCase() ?? "")
+        : Promise.resolve({ data: [] }),
     ]);
+    const requested = new URLSearchParams(location.search).get("exam");
+    const e = (allExams ?? []).filter(
+      (item) =>
+        item.active ||
+        item.id === requested ||
+        plans?.some((plan) => plan.exam_id === item.id),
+    );
+    setLoadFailed(!!(ee || ce));
     if (ee || ce)
       setMessage("We could not load the directory. Please try again.");
     setExams(e || []);
     setCentres(c || []);
-    const requested = new URLSearchParams(location.search).get("exam");
     setExam(
       (prev) =>
-        prev ||
+        (e.some((item) => item.id === prev) ? prev : null) ||
         (e?.some((item) => item.id === requested)
           ? requested!
           : (e?.[0]?.id ?? "")),
@@ -95,6 +134,11 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
     if (u) {
       const { data: a } = await db.rpc("is_approved");
       setApproved(!!a);
+      if (!a) {
+        refreshSequence.current++;
+        setMates([]);
+        setOwn(null);
+      }
       const { data: ad } = await db.rpc("is_admin");
       setAdmin(!!ad);
     } else {
@@ -104,55 +148,74 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
       setOwn(null);
     }
     setLoading(false);
-  }, []);
+  }, [db]);
   useEffect(() => {
     const init = setTimeout(() => void load(), 0);
     const listener = db?.auth.onAuthStateChange(() => {
-      void load();
+      setTimeout(() => void load(), 0);
     });
     return () => {
       clearTimeout(init);
       listener?.data.subscription.unsubscribe();
     };
-  }, [load]);
+  }, [load, db]);
   const refresh = useCallback(async () => {
     if (!db || !exam || !approved) return;
-    const { data: counts } = await db.rpc("centre_counts", { p_exam: exam });
+    const ticket = ++refreshSequence.current;
+    setPeopleLoading(true);
+    const [counts, directory, registration] = await Promise.all([
+      db.rpc("centre_counts", { p_exam: exam }),
+      centreId
+        ? db.rpc("directory", { p_exam: exam, p_centre: centreId })
+        : Promise.resolve({ data: [], error: null }),
+      db
+        .from("registrations")
+        .select("*")
+        .eq("exam_id", exam)
+        .eq("email", user?.email?.toLowerCase() ?? "")
+        .maybeSingle(),
+    ]);
+    if (ticket !== refreshSequence.current) return;
+    setPeopleLoading(false);
+    const error = counts.error || directory.error || registration.error;
+    if (error) {
+      setMessage("Your plans could not be refreshed. " + error.message);
+      return;
+    }
     setCentres((prev) =>
       prev.map((c) => ({
         ...c,
         total:
-          counts?.find(
+          counts.data?.find(
             (n: { centre_id: string; total: number }) => n.centre_id === c.id,
           )?.total ?? 0,
       })),
     );
-    if (centreId) {
-      const { data, error } = await db.rpc("directory", {
-        p_exam: exam,
-        p_centre: centreId,
-      });
-      if (error) setMessage(error.message);
-      setMates(data || []);
-    }
-    const { data: r } = await db
-      .from("registrations")
-      .select("*")
-      .eq("exam_id", exam)
-      .eq("email", user?.email?.toLowerCase() ?? "")
-      .maybeSingle();
-    setOwn(r);
-  }, [exam, approved, centreId, user?.email]);
+    setMates(directory.data ?? []);
+    setOwn(registration.data);
+  }, [exam, approved, centreId, user?.email, db]);
   useEffect(() => {
     const init = setTimeout(() => void refresh(), 0);
-    const timer = setInterval(() => {
-      void refresh();
-    }, 30000);
+    const timer = setInterval(() => void refresh(), 30000);
     return () => {
       clearTimeout(init);
       clearInterval(timer);
+      // Invalidate pending requests; this ref is a request counter, not a DOM ref.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      refreshSequence.current++;
     };
   }, [refresh]);
+  function chooseExam(value: string) {
+    refreshSequence.current++;
+    setOwn(null);
+    setMates([]);
+    setPeopleLoading(!!approved);
+    setExam(value);
+    setCentres((prev) => prev.map((c) => ({ ...c, total: undefined })));
+    const url = new URL(location.href);
+    url.searchParams.set("exam", value);
+    history.replaceState(null, "", url);
+  }
   async function login() {
     if (!db) {
       setMessage(
@@ -160,6 +223,11 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
       );
       return;
     }
+    document.cookie =
+      "centremate_next=" +
+      encodeURIComponent(safeReturnPath(location.pathname + location.search)) +
+      "; Path=/; Max-Age=600; SameSite=Lax" +
+      (location.protocol === "https:" ? "; Secure" : "");
     const { error } = await db.auth.signInWithOAuth({
       provider: "google",
       options: { redirectTo: location.origin + "/auth/callback" },
@@ -181,63 +249,102 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
       setMessage("Choose an exam first.");
       return;
     }
-    setModal("register");
+    openModal("register");
   }
   async function save(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!db || !user) return;
-    setBusy(true);
+    if (!db || !user || busy) return;
+    setModalError("");
     const f = new FormData(event.currentTarget);
-    const payload = {
-      email: user.email!.toLowerCase(),
+    const result = registrationSchema.safeParse({
+      email: user.email,
       exam_id: exam,
-      centre_id: String(f.get("centre_id")),
-      name: String(f.get("name")).trim(),
-      hostel: String(f.get("hostel")),
-      departure: f.get("departure") || null,
-      whatsapp:
-        String(f.get("whatsapp") || "").replace(/[\s+()-]/g, "") || null,
+      centre_id: f.get("centre_id"),
+      name: f.get("name"),
+      hostel: f.get("hostel"),
+      departure: String(f.get("departure") ?? ""),
+      whatsapp: String(f.get("whatsapp") ?? ""),
       visible: f.get("visible") === "on",
       going: f.get("going") === "on",
-      source: "website",
-      ready_until: null,
-    };
-    const { error } = await db
-      .from("registrations")
-      .upsert(payload, { onConflict: "exam_id,email" });
-    setBusy(false);
-    if (error) {
-      setMessage(error.message);
+    });
+    if (!result.success) {
+      setModalError(result.error.issues[0].message);
       return;
     }
-    setModal(null);
-    setMessage("Your registration is saved. You can update it anytime.");
-    await refresh();
+    setBusy(true);
+    try {
+      const payload = {
+        ...result.data,
+        source: "website",
+        ...(own && own.centre_id !== result.data.centre_id
+          ? { ready_until: null }
+          : {}),
+      };
+      const { error } = await db
+        .from("registrations")
+        .upsert(payload, { onConflict: "exam_id,email" });
+      if (error) throw error;
+      setModal(null);
+      setMessage("Your registration is saved. You can update it anytime.");
+      await refresh();
+      if (result.data.centre_id !== centreId)
+        location.assign(
+          new URL(
+            "/centre/" + result.data.centre_id + "?exam=" + exam,
+            location.origin,
+          ),
+        );
+    } catch (error) {
+      setModalError(errorMessage(error));
+    } finally {
+      setBusy(false);
+    }
   }
   async function returnReady() {
-    if (!db || !own) return;
-    const { error } = await db
-      .from("registrations")
-      .update({
-        ready_until:
-          own.ready_until && new Date(String(own.ready_until)) > new Date()
-            ? null
-            : new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
-        source: "website",
-      })
-      .eq("id", own.id);
-    if (error) setMessage(error.message);
-    await refresh();
+    if (!db || !own || busy) return;
+    setBusy(true);
+    try {
+      const { error } = await db.rpc("set_return_status", {
+        p_registration: own.id,
+        p_ready: !isReturning(String(own.ready_until ?? "")),
+      });
+      if (error) throw error;
+      setMessage(
+        own.visible
+          ? "Return status updated. It automatically expires after 2 hours."
+          : "Status saved privately. Edit your registration and enable directory sharing if you want others to find you.",
+      );
+      await refresh();
+    } catch (error) {
+      setMessage(errorMessage(error));
+    } finally {
+      setBusy(false);
+    }
   }
   async function remove() {
-    if (!db || !own || !confirm("Delete your registration for this exam?"))
+    if (
+      !db ||
+      !own ||
+      busy ||
+      !confirm("Delete your registration for this exam?")
+    )
       return;
-    const { error } = await db.from("registrations").delete().eq("id", own.id);
-    if (error) setMessage(error.message);
-    else {
+    setBusy(true);
+    try {
+      const { error } = await db
+        .from("registrations")
+        .delete()
+        .eq("id", own.id);
+      if (error) throw error;
       setOwn(null);
-      setMessage("Registration deleted.");
+      setMessage(
+        "Registration deleted. Form sync will not recreate it. You can register again anytime.",
+      );
       await refresh();
+    } catch (error) {
+      setMessage(errorMessage(error));
+    } finally {
+      setBusy(false);
     }
   }
   async function contact(id: string) {
@@ -248,7 +355,7 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
       );
       return;
     }
-    window.open("https://wa.me/" + data, "_blank", "noopener,noreferrer");
+    location.assign("https://wa.me/" + data);
   }
   const filtered = centres.filter((c) =>
     (c.name + " " + c.address).toLowerCase().includes(query.toLowerCase()),
@@ -419,12 +526,16 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
               </div>
               <h2>
                 {centreId
-                  ? (centre?.name ?? "Exam centre")
+                  ? (centre?.name ??
+                    (loading ? "Loading centre…" : "Centre not found"))
                   : "Where’s your exam?"}
               </h2>
               <p>
                 {centreId
-                  ? (centre?.address ?? "Loading centre details…")
+                  ? (centre?.address ??
+                    (loading
+                      ? "Loading centre details…"
+                      : "This centre link is unavailable. Return to the directory to find your centre."))
                   : "Pick your exam and find the centre on your hall ticket."}
               </p>
             </div>
@@ -432,20 +543,17 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
               <GraduationCap size={19} />
               <select
                 aria-label="Select examination"
+                disabled={busy || loading}
                 value={exam}
-                onChange={(e) => {
-                  setExam(e.target.value);
-                  const url = new URL(location.href);
-                  url.searchParams.set("exam", e.target.value);
-                  history.replaceState(null, "", url);
-                }}
+                onChange={(e) => chooseExam(e.target.value)}
               >
                 {!exams.length && (
                   <option value="">No upcoming exams yet</option>
                 )}
                 {exams.map((e) => (
                   <option key={e.id} value={e.id}>
-                    {e.name} ·{" "}
+                    {e.name}
+                    {!e.active ? " (archived)" : ""} ·{" "}
                     {new Date(e.exam_date + "T12:00:00").toLocaleDateString(
                       "en-IN",
                       { day: "numeric", month: "short" },
@@ -459,6 +567,11 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
           {message && (
             <div className="notice" role="status">
               {message}
+              {loadFailed && (
+                <button className="text-link" onClick={() => void load()}>
+                  Try again
+                </button>
+              )}
               <button onClick={() => setMessage("")} aria-label="Dismiss">
                 <X size={17} />
               </button>
@@ -518,7 +631,7 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
                         <span>
                           <Users size={16} />
                           {approved
-                            ? `${c.total ?? 0} students`
+                            ? `${c.total ?? "…"} students`
                             : "Sign in to see your people"}
                         </span>
                         <span className="view-centre">
@@ -571,13 +684,17 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
                 <Button
                   variant="outline"
                   onClick={() => {
+                    if (!user) {
+                      void login();
+                      return;
+                    }
                     if (!approved) {
                       setMessage(
                         "Sign in with an approved Scaler account to request a centre.",
                       );
                       return;
                     }
-                    setModal("request");
+                    openModal("request");
                   }}
                 >
                   <Plus size={16} /> Request a centre
@@ -587,7 +704,10 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
           ) : (
             <>
               <div className="centre-toolbar">
-                <Button onClick={register}>
+                <Button
+                  disabled={loading || peopleLoading || !centre || !exam}
+                  onClick={register}
+                >
                   {ownAtCentre
                     ? "Edit registration"
                     : own
@@ -602,13 +722,32 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
                       if (navigator.share)
                         await navigator.share({
                           title: centre?.name,
-                          url: location.href,
+                          url:
+                            location.origin +
+                            "/centre/" +
+                            centreId +
+                            "?exam=" +
+                            exam,
                         });
                       else {
-                        await navigator.clipboard.writeText(location.href);
+                        await navigator.clipboard.writeText(
+                          location.origin +
+                            "/centre/" +
+                            centreId +
+                            "?exam=" +
+                            exam,
+                        );
                         setMessage("Centre link copied.");
                       }
-                    } catch {}
+                    } catch (error) {
+                      if (!(
+                        error instanceof DOMException &&
+                        error.name === "AbortError"
+                      ))
+                        setMessage(
+                          "Could not share automatically. Copy this centre’s address from your browser.",
+                        );
+                    }
                   }}
                 >
                   <Share2 size={16} /> Share
@@ -642,21 +781,29 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
                         : ""}
                     </p>
                   </div>
-                  <Button variant="outline" onClick={returnReady}>
+                  <Button
+                    disabled={busy}
+                    variant="outline"
+                    onClick={returnReady}
+                  >
                     <Check size={16} />
-                    {own.ready_until &&
-                    new Date(String(own.ready_until)) > new Date()
+                    {isReturning(String(own.ready_until ?? ""))
                       ? "Cancel return status"
                       : "Ready to Return"}
                   </Button>
-                  <button className="delete-link" onClick={remove}>
+                  <button
+                    disabled={busy}
+                    className="delete-link"
+                    onClick={remove}
+                  >
                     Delete registration
                   </button>
                 </div>
               )}
-              <div className="tabs">
+              <div className="tabs" role="group" aria-label="Filter students">
                 {["Everyone", "Going", "Returning"].map((t) => (
                   <button
+                    aria-pressed={tab === t}
                     className={tab === t ? "selected" : ""}
                     onClick={() => setTab(t)}
                     key={t}
@@ -670,8 +817,7 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
                               t === "Everyone" ||
                               (t === "Going"
                                 ? m.going
-                                : m.ready_until &&
-                                  new Date(m.ready_until) > new Date()),
+                                : isReturning(m.ready_until)),
                           ).length
                         }
                       </span>
@@ -695,6 +841,10 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
                     Continue with Google <ArrowRight size={16} />
                   </Button>
                 </div>
+              ) : peopleLoading && !mates.length ? (
+                <div className="empty" role="status">
+                  <Loader2 className="spin" /> Loading your centre’s plans…
+                </div>
               ) : (
                 <div className="mates-grid">
                   {mates
@@ -703,8 +853,7 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
                         tab === "Everyone" ||
                         (tab === "Going"
                           ? m.going
-                          : m.ready_until &&
-                            new Date(m.ready_until) > new Date()),
+                          : isReturning(m.ready_until)),
                     )
                     .map((m) => (
                       <div className="mate-card" key={m.id}>
@@ -718,7 +867,7 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
                             {m.departure ? " · " + m.departure.slice(0, 5) : ""}
                           </p>
                           <span className="status">
-                            {m.ready_until
+                            {isReturning(m.ready_until)
                               ? "Ready to return"
                               : m.going
                                 ? "Open to sharing a ride"
@@ -738,10 +887,7 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
                   {!mates.filter(
                     (m) =>
                       tab === "Everyone" ||
-                      (tab === "Going"
-                        ? m.going
-                        : m.ready_until &&
-                          new Date(m.ready_until) > new Date()),
+                      (tab === "Going" ? m.going : isReturning(m.ready_until)),
                   ).length && (
                     <div className="empty">
                       <Users size={30} />
@@ -825,8 +971,13 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
           aria-label={
             modal === "register" ? "Your exam plans" : "Request a centre"
           }
-          onCancel={() => setModal(null)}
-          onClick={() => setModal(null)}
+          onCancel={(e) => {
+            if (busy) e.preventDefault();
+            else setModal(null);
+          }}
+          onClick={() => {
+            if (!busy) setModal(null);
+          }}
         >
           <section
             className="modal"
@@ -837,7 +988,10 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
           >
             <button
               className="modal-close"
-              onClick={() => setModal(null)}
+              onClick={() => {
+                if (!busy) setModal(null);
+              }}
+              disabled={busy}
               aria-label="Close"
             >
               <X size={21} />
@@ -855,6 +1009,11 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
                 ? "A few details, and you’re good to go."
                 : "Your coordinator will review the details before adding it."}
             </p>
+            {modalError && (
+              <div className="notice" role="alert">
+                {modalError}
+              </div>
+            )}
             {modal === "register" ? (
               <form onSubmit={save}>
                 <label>
@@ -880,7 +1039,7 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
                     </option>
                     {centres.map((c) => (
                       <option key={c.id} value={c.id}>
-                        {c.name}
+                        {c.name} — {c.address}
                       </option>
                     ))}
                   </select>
@@ -945,20 +1104,33 @@ export default function CentreMate({ centreId }: { centreId?: string }) {
               <form
                 onSubmit={async (e) => {
                   e.preventDefault();
-                  setBusy(true);
+                  if (busy) return;
+                  setModalError("");
                   const f = new FormData(e.currentTarget);
-                  const { error } = await db!.from("centre_requests").insert({
-                    email: user!.email!.toLowerCase(),
+                  const parsed = centreSchema.safeParse({
                     name: f.get("name"),
                     address: f.get("address"),
                   });
-                  setBusy(false);
-                  setMessage(
-                    error
-                      ? error.message
-                      : "Centre request sent. Your coordinator will review it.",
-                  );
-                  if (!error) setModal(null);
+                  if (!parsed.success) {
+                    setModalError(parsed.error.issues[0].message);
+                    return;
+                  }
+                  setBusy(true);
+                  try {
+                    const { error } = await db!.from("centre_requests").insert({
+                      ...parsed.data,
+                      email: user!.email!.toLowerCase(),
+                    });
+                    if (error) throw error;
+                    setMessage(
+                      "Centre request sent. Your coordinator will review it.",
+                    );
+                    setModal(null);
+                  } catch (error) {
+                    setModalError(errorMessage(error));
+                  } finally {
+                    setBusy(false);
+                  }
                 }}
               >
                 <label>

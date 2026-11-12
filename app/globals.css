@@ -1384,3 +1384,40 @@ dialog.modal-overlay {
 dialog.modal-overlay::backdrop {
   background: transparent;
 }
+.import-mapping {
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  margin: 20px 0;
+  background: #fafcfe;
+}
+.import-mapping > p {
+  font-size: 12px;
+}
+.admin li small {
+  overflow-wrap: anywhere;
+}
+.admin .button {
+  margin-top: 8px;
+}
+.admin .text-link {
+  color: var(--blue);
+  margin: 15px 0;
+}
+.admin li button:not(.button) {
+  border: 0;
+  background: #f5f7fb;
+  color: var(--navy);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 11px;
+}
+.admin li p {
+  margin: 8px 0;
+}
+.admin label {
+  margin-bottom: 10px;
+}
+.tabs button:focus-visible {
+  outline: 2px solid var(--blue);
+}
